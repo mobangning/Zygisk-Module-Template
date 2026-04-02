@@ -1,79 +1,83 @@
-/* Copyright 2022-2023 John "topjohnwu" Wu
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
- * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
- * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
- * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
- * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
- * OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
- * PERFORMANCE OF THIS SOFTWARE.
- */
-
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
 #include <android/log.h>
-
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
+#include <stdio.h>
 #include "zygisk.hpp"
+
+// 日志前缀改成了通用的 Global-CamHook
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Global-CamHook", __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "MyModule", __VA_ARGS__)
+int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode);
+int (*orig_ioctl)(int fd, unsigned long request, ...);
 
-class MyModule : public zygisk::ModuleBase {
+// 默认节点
+char target_node[64] = "/dev/video1"; 
+char fake_node[64] = "/dev/video0";   
+
+void load_config() {
+    FILE *fp = fopen("/data/local/tmp/camera_config.txt", "r");
+    if (fp) {
+        fscanf(fp, "%63s %63s", target_node, fake_node);
+        fclose(fp);
+    }
+}
+
+// 核心战术 1：全局改门牌
+int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    if (pathname != nullptr && strstr(pathname, target_node)) {
+        LOGD("【全局拦截】成功捕获节点读取 %s，强行重定向至 %s", pathname, fake_node);
+        return orig_openat(dirfd, fake_node, flags, mode);
+    }
+    return orig_openat(dirfd, pathname, flags, mode);
+}
+
+// 核心战术 2：全局造假证
+int my_ioctl(int fd, unsigned long request, void* argp) {
+    int ret = orig_ioctl(fd, request, argp);
+    if (request == VIDIOC_QUERYCAP && ret == 0) {
+        struct v4l2_capability *cap = (struct v4l2_capability *)argp;
+        if (strstr((char*)cap->card, "Dummy")) {
+            LOGD("【全局伪装】成功篡改底层特征为高通 Qcamera2");
+            strlcpy((char*)cap->card, "Qcamera2", sizeof(cap->card));
+            strlcpy((char*)cap->driver, "msm_v4l2", sizeof(cap->driver));
+        }
+    }
+    return ret;
+}
+
+// 模块类名已重构为通用类名
+class GlobalCameraHookModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        // Use JNI to fetch our process name
-        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
-        preSpecialize(process);
-        env->ReleaseStringUTFChars(args->nice_name, process);
+    // 注入系统的底层框架服务
+    void preServerSpecialize(ServerSpecializeArgs *args) override {
+        api->pltHook("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
+        api->pltHook("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
     }
 
-    void preServerSpecialize(ServerSpecializeArgs *args) override {
-        preSpecialize("system_server");
+    // 无差别注入所有被 Zygote 孵化的 App（系统相机、所有第三方应用）
+    void preAppSpecialize(AppSpecializeArgs *args) override {
+        load_config(); // 注入时加载一次路径配置
+        api->pltHook("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
+        api->pltHook("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
     }
 
 private:
     Api *api;
     JNIEnv *env;
-
-    void preSpecialize(const char *process) {
-        // Demonstrate connecting to to companion process
-        // We ask the companion for a random number
-        unsigned r = 0;
-        int fd = api->connectCompanion();
-        read(fd, &r, sizeof(r));
-        close(fd);
-        LOGD("process=[%s], r=[%u]\n", process, r);
-
-        // Since we do not hook any functions, we should let Zygisk dlclose ourselves
-        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-    }
-
 };
 
-static int urandom = -1;
-
-static void companion_handler(int i) {
-    if (urandom < 0) {
-        urandom = open("/dev/urandom", O_RDONLY);
-    }
-    unsigned r;
-    read(urandom, &r, sizeof(r));
-    LOGD("companion r=[%u]\n", r);
-    write(i, &r, sizeof(r));
-}
-
-// Register our module class and the companion handler function
-REGISTER_ZYGISK_MODULE(MyModule)
-REGISTER_ZYGISK_COMPANION(companion_handler)
+// 注册激活全局模块
+REGISTER_ZYGISK_MODULE(GlobalCameraHookModule)
