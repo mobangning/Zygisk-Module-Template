@@ -17,7 +17,7 @@ using zygisk::ServerSpecializeArgs;
 int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode);
 int (*orig_ioctl)(int fd, unsigned long request, ...);
 
-// 【核心变量区】这里绝对不能漏复制，它是配置文件的灵魂！
+// 【核心变量区】动态读取的保底配置
 char target_node[64] = "/dev/video1"; 
 char fake_node[64] = "/dev/video0";   
 
@@ -46,7 +46,6 @@ int my_ioctl(int fd, unsigned long request, void* argp) {
         struct v4l2_capability *cap = (struct v4l2_capability *)argp;
         if (strstr((char*)cap->card, "Dummy")) {
             LOGD("【全局伪装】成功篡改底层特征为高通 Qcamera2");
-            // 换用绝对安全标准的 strncpy 防止 NDK 报错
             strncpy((char*)cap->card, "Qcamera2", sizeof(cap->card) - 1);
             strncpy((char*)cap->driver, "msm_v4l2", sizeof(cap->driver) - 1);
         }
@@ -62,14 +61,18 @@ public:
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        api->pltHook("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
-        api->pltHook("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        // 升级为 Zygisk v4 专属连招 API
+        api->pltHookRegister("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
+        api->pltHookRegister("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        api->pltHookCommit();
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
         load_config(); 
-        api->pltHook("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
-        api->pltHook("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        // 升级为 Zygisk v4 专属连招 API
+        api->pltHookRegister("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
+        api->pltHookRegister("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        api->pltHookCommit();
     }
 
 private:
