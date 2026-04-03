@@ -6,7 +6,7 @@
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 #include <stdio.h>
-#include <dlfcn.h>
+#include <sys/stat.h>
 #include "zygisk.hpp"
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Global-CamHook", __VA_ARGS__)
@@ -50,14 +50,26 @@ int my_ioctl(int fd, unsigned long request, void* argp) {
     return ret;
 }
 
-// 终极绝杀：强行定位 libc.so 并启动 Inline Hook
-void start_ultimate_hook(Api *api) {
-    void *libc_handle = dlopen("libc.so", RTLD_LAZY);
-    if (libc_handle) {
-        void *openat_ptr = dlsym(libc_handle, "openat");
-        void *ioctl_ptr = dlsym(libc_handle, "ioctl");
-        if (openat_ptr) api->hook(openat_ptr, (void *)my_openat, (void **)&orig_openat);
-        if (ioctl_ptr) api->hook(ioctl_ptr, (void *)my_ioctl, (void **)&orig_ioctl);
+// 终极侦察兵：硬刚 Zygisk v4 的苛刻要求，自动扒出 libc.so 的设备号和节点号！
+void hookLibc(Api *api, const char *symbol, void *newFunc, void **oldFunc) {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            // 在内存表里寻找 libc.so 的绝对路径
+            if (strstr(line, "libc.so") && strchr(line, '/')) {
+                char path[256];
+                sscanf(strchr(line, '/'), "%255s", path);
+                struct stat st;
+                // 用 stat 读取出设备的 dev 和 inode
+                if (stat(path, &st) == 0) {
+                    // 完美满足 5 个参数的苛刻要求！
+                    api->pltHookRegister(st.st_dev, st.st_ino, symbol, newFunc, oldFunc);
+                    break; // 挂载成功，退出侦察
+                }
+            }
+        }
+        fclose(fp);
     }
 }
 
@@ -69,12 +81,16 @@ public:
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        start_ultimate_hook(api);
+        hookLibc(api, "openat", (void *)my_openat, (void **)&orig_openat);
+        hookLibc(api, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        api->pltHookCommit();
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
         load_config(); 
-        start_ultimate_hook(api);
+        hookLibc(api, "openat", (void *)my_openat, (void **)&orig_openat);
+        hookLibc(api, "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
+        api->pltHookCommit();
     }
 
 private:
