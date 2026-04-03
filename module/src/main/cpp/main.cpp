@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 #include <stdio.h>
+#include <dlfcn.h>
 #include "zygisk.hpp"
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "Global-CamHook", __VA_ARGS__)
@@ -17,11 +18,9 @@ using zygisk::ServerSpecializeArgs;
 int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode);
 int (*orig_ioctl)(int fd, unsigned long request, ...);
 
-// 【核心变量区】动态读取的保底配置
 char target_node[64] = "/dev/video1"; 
 char fake_node[64] = "/dev/video0";   
 
-// 读取外部配置的逻辑
 void load_config() {
     FILE *fp = fopen("/data/local/tmp/camera_config.txt", "r");
     if (fp) {
@@ -30,7 +29,6 @@ void load_config() {
     }
 }
 
-// 核心战术 1：全局改门牌
 int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
     if (pathname != nullptr && strstr(pathname, target_node)) {
         LOGD("【全局拦截】成功捕获节点读取，强行重定向");
@@ -39,7 +37,6 @@ int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
     return orig_openat(dirfd, pathname, flags, mode);
 }
 
-// 核心战术 2：全局造假证
 int my_ioctl(int fd, unsigned long request, void* argp) {
     int ret = orig_ioctl(fd, request, argp);
     if (request == VIDIOC_QUERYCAP && ret == 0) {
@@ -53,6 +50,17 @@ int my_ioctl(int fd, unsigned long request, void* argp) {
     return ret;
 }
 
+// 终极绝杀：强行定位 libc.so 并启动 Inline Hook
+void start_ultimate_hook(Api *api) {
+    void *libc_handle = dlopen("libc.so", RTLD_LAZY);
+    if (libc_handle) {
+        void *openat_ptr = dlsym(libc_handle, "openat");
+        void *ioctl_ptr = dlsym(libc_handle, "ioctl");
+        if (openat_ptr) api->hook(openat_ptr, (void *)my_openat, (void **)&orig_openat);
+        if (ioctl_ptr) api->hook(ioctl_ptr, (void *)my_ioctl, (void **)&orig_ioctl);
+    }
+}
+
 class GlobalCameraHookModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
@@ -61,18 +69,12 @@ public:
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        // 升级为 Zygisk v4 专属连招 API
-        api->pltHookRegister("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
-        api->pltHookRegister("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
-        api->pltHookCommit();
+        start_ultimate_hook(api);
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
         load_config(); 
-        // 升级为 Zygisk v4 专属连招 API
-        api->pltHookRegister("libc.so", "openat", (void *)my_openat, (void **)&orig_openat);
-        api->pltHookRegister("libc.so", "ioctl", (void *)my_ioctl, (void **)&orig_ioctl);
-        api->pltHookCommit();
+        start_ultimate_hook(api);
     }
 
 private:
